@@ -2,9 +2,16 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, executionWorkspaces, issueExecutionDecisions, projectWorkspaces } from "@paperclipai/db";
+import {
+  activityLog,
+  executionWorkspaces,
+  issueExecutionDecisions,
+  issueRelations,
+  issues as issueRows,
+  projectWorkspaces,
+} from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -17,6 +24,8 @@ import {
   checkoutIssueSchema,
   createChildIssueSchema,
   createIssueSchema,
+  resolveCreateIssueStatusDefault,
+  resolveIssueRecoveryActionSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
@@ -36,6 +45,7 @@ import {
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
+  type IssueRelationIssueSummary,
   type SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
@@ -52,6 +62,7 @@ import {
   goalService,
   heartbeatService,
   issueApprovalService,
+  issueRecoveryActionService,
   issueThreadInteractionService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
@@ -136,6 +147,44 @@ type SuccessfulRunHandoffActivityRow = {
   details: Record<string, unknown> | null;
   createdAt: Date;
 };
+
+function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => void) {
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    next();
+    return;
+  }
+
+  const resolution = resolveCreateIssueStatusDefault(req.body as Record<string, unknown>);
+  res.locals.createIssueStatusDefault = resolution;
+  if (resolution.defaulted) {
+    req.body = {
+      ...req.body,
+      status: resolution.status,
+    };
+  }
+  next();
+}
+
+function buildCreateIssueActivityStatusDetails(
+  issue: { assigneeAgentId: string | null; status: string },
+  res: Response,
+) {
+  const statusDefault = res.locals.createIssueStatusDefault as
+    | ReturnType<typeof resolveCreateIssueStatusDefault>
+    | undefined;
+  const assignmentWakeSkipped = !issue.assigneeAgentId || issue.status === "backlog";
+  return {
+    status: issue.status,
+    statusDefaulted: statusDefault?.defaulted ?? false,
+    statusDefaultReason: statusDefault?.reason ?? "explicit",
+    assignmentWakeSkipped,
+    assignmentWakeSkipReason: assignmentWakeSkipped
+      ? issue.assigneeAgentId
+        ? "assigned_backlog"
+        : "no_agent_assignee"
+      : null,
+  };
+}
 
 const SUCCESSFUL_RUN_HANDOFF_ACTIONS = [
   "issue.successful_run_handoff_required",
@@ -364,6 +413,47 @@ async function listSuccessfulRunHandoffStates(
     if (state) states.set(row.entityId, state);
   }
   return states;
+}
+
+type RecoveryActionsLister = {
+  listActiveForIssues: (
+    companyId: string,
+    sourceIssueIds: string[],
+  ) => Promise<Map<string, NonNullable<IssueRelationIssueSummary["activeRecoveryAction"]>>>;
+};
+
+async function relationRecoveryActionMap(
+  recoveryActionsSvc: RecoveryActionsLister,
+  companyId: string,
+  relations: { blockedBy: IssueRelationIssueSummary[]; blocks: IssueRelationIssueSummary[] },
+): Promise<Map<string, NonNullable<IssueRelationIssueSummary["activeRecoveryAction"]>>> {
+  const candidates: IssueRelationIssueSummary[] = [];
+  const visit = (summary: IssueRelationIssueSummary) => {
+    candidates.push(summary);
+    for (const terminal of summary.terminalBlockers ?? []) {
+      visit(terminal);
+    }
+  };
+  for (const blocker of relations.blockedBy) visit(blocker);
+  for (const blocking of relations.blocks) visit(blocking);
+  if (candidates.length === 0) return new Map();
+  const ids = [...new Set(candidates.map((summary) => summary.id))];
+  return recoveryActionsSvc.listActiveForIssues(companyId, ids);
+}
+
+function withRecoveryActionsOnRelationSummaries(
+  relations: { blockedBy: IssueRelationIssueSummary[]; blocks: IssueRelationIssueSummary[] },
+  recoveryActionByIssueId: Map<string, NonNullable<IssueRelationIssueSummary["activeRecoveryAction"]>>,
+) {
+  const augment = (summary: IssueRelationIssueSummary): IssueRelationIssueSummary => ({
+    ...summary,
+    activeRecoveryAction: recoveryActionByIssueId.get(summary.id) ?? summary.activeRecoveryAction ?? null,
+    terminalBlockers: summary.terminalBlockers?.map(augment),
+  });
+  return {
+    blockedBy: relations.blockedBy.map(augment),
+    blocks: relations.blocks.map(augment),
+  };
 }
 
 const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
@@ -748,6 +838,7 @@ export function issueRoutes(
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
@@ -1408,14 +1499,15 @@ export function issueRoutes(
       limit,
       offset,
     });
-    const handoffStates = await listSuccessfulRunHandoffStates(
-      db,
-      companyId,
-      result.map((issue) => issue.id),
-    );
+    const issueIds = result.map((issue) => issue.id);
+    const [handoffStates, recoveryActionByIssue] = await Promise.all([
+      listSuccessfulRunHandoffStates(db, companyId, issueIds),
+      recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
+    ]);
     res.json(result.map((issue) => ({
       ...issue,
       successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+      activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
     })));
   });
 
@@ -1498,9 +1590,11 @@ export function issueRoutes(
       relations,
       blockerAttention,
       productivityReview,
+      scheduledRetry,
       attachments,
       continuationSummary,
       currentExecutionWorkspace,
+      activeRecoveryAction,
     ] =
       await Promise.all([
         resolveIssueProjectAndGoal(issue),
@@ -1510,10 +1604,21 @@ export function issueRoutes(
         svc.getRelationSummaries(issue.id),
         svc.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
         svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
+        svc.getCurrentScheduledRetry(issue.id),
         svc.listAttachments(issue.id),
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
         currentExecutionWorkspacePromise,
+        recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       ]);
+    const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
+      recoveryActionsSvc,
+      issue.companyId,
+      relations,
+    );
+    const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
+      relations,
+      recoveryActionsByRelationIssue,
+    );
 
     res.json({
       issue: {
@@ -1525,12 +1630,14 @@ export function issueRoutes(
         workMode: issue.workMode,
         ...(blockerAttention ? { blockerAttention } : {}),
         productivityReview,
+        scheduledRetry,
+        activeRecoveryAction,
         priority: issue.priority,
         projectId: issue.projectId,
         goalId: goal?.id ?? issue.goalId,
         parentId: issue.parentId,
-        blockedBy: relations.blockedBy,
-        blocks: relations.blocks,
+        blockedBy: relationsWithRecoveryActions.blockedBy,
+        blocks: relationsWithRecoveryActions.blocks,
         assigneeAgentId: issue.assigneeAgentId,
         assigneeUserId: issue.assigneeUserId,
         originKind: issue.originKind,
@@ -1606,6 +1713,8 @@ export function issueRoutes(
       productivityReview,
       referenceSummary,
       successfulRunHandoffStates,
+      scheduledRetry,
+      activeRecoveryAction,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -1616,7 +1725,18 @@ export function issueRoutes(
       svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
       issueReferencesSvc.listIssueReferenceSummary(issue.id),
       listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
+      svc.getCurrentScheduledRetry(issue.id),
+      recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
     ]);
+    const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
+      recoveryActionsSvc,
+      issue.companyId,
+      relations,
+    );
+    const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
+      relations,
+      recoveryActionsByRelationIssue,
+    );
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
@@ -1631,8 +1751,10 @@ export function issueRoutes(
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
-      blockedBy: relations.blockedBy,
-      blocks: relations.blocks,
+      scheduledRetry,
+      activeRecoveryAction,
+      blockedBy: relationsWithRecoveryActions.blockedBy,
+      blocks: relationsWithRecoveryActions.blocks,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       ...documentPayload,
@@ -1641,6 +1763,148 @@ export function issueRoutes(
       mentionedProjects,
       currentExecutionWorkspace,
       workProducts,
+    });
+  });
+
+  router.get("/issues/:id/recovery-actions", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const active = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    res.json({
+      active,
+      actions: active ? [active] : [],
+    });
+  });
+
+  router.post("/issues/:id/recovery-actions/resolve", validate(resolveIssueRecoveryActionSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+
+    const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
+    if (outcome === "false_positive" || outcome === "cancelled") {
+      assertBoard(req);
+    }
+
+    const actor = getActorInfo(req);
+    const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
+    await assertAgentInReviewReviewPath({
+      existing,
+      updateFields,
+      actorType: req.actor.type,
+    });
+
+    const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+    const result = await db.transaction(async (tx) => {
+      let issue = existing;
+      if (outcome === "blocked") {
+        const unresolvedBlockers = await tx
+          .select({ id: issueRows.id })
+          .from(issueRelations)
+          .innerJoin(issueRows, eq(issueRelations.issueId, issueRows.id))
+          .where(
+            and(
+              eq(issueRelations.companyId, existing.companyId),
+              eq(issueRelations.relatedIssueId, existing.id),
+              eq(issueRelations.type, "blocks"),
+              notInArray(issueRows.status, ["done", "cancelled"]),
+            ),
+          )
+          .limit(1);
+        if (unresolvedBlockers.length === 0) {
+          throw unprocessable("Blocked recovery resolution requires an unresolved first-class blocker on the source issue");
+        }
+      }
+
+      if (sourceIssueStatus) {
+        const updatedIssue = await svc.update(
+          id,
+          {
+            status: sourceIssueStatus,
+            actorAgentId: actor.agentId ?? null,
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          tx,
+        );
+        if (!updatedIssue) throw notFound("Issue not found");
+        issue = updatedIssue;
+      }
+
+      const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+        {
+          companyId: existing.companyId,
+          sourceIssueId: existing.id,
+          actionId: actionId ?? null,
+          status: actionStatus,
+          outcome,
+          resolutionNote: resolutionNote ?? null,
+        },
+        tx,
+      );
+      if (!recoveryAction) throw notFound("Active recovery action not found");
+
+      return { issue, recoveryAction };
+    });
+
+    await routinesSvc.syncRunStatusForIssue(result.issue.id);
+
+    if (sourceIssueStatus && existing.status !== result.issue.status) {
+      await logActivity(db, {
+        companyId: result.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: result.issue.id,
+        details: {
+          identifier: result.issue.identifier,
+          status: result.issue.status,
+          source: "recovery_action_resolution",
+          recoveryActionId: result.recoveryAction.id,
+          _previous: {
+            status: existing.status,
+          },
+        },
+      });
+    }
+
+    await logActivity(db, {
+      companyId: result.issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.recovery_action_resolved",
+      entityType: "issue",
+      entityId: result.issue.id,
+      details: {
+        identifier: result.issue.identifier,
+        recoveryActionId: result.recoveryAction.id,
+        recoveryActionStatus: result.recoveryAction.status,
+        outcome: result.recoveryAction.outcome,
+        sourceIssueStatus: sourceIssueStatus ?? null,
+        resolutionNote: result.recoveryAction.resolutionNote,
+      },
+    });
+
+    res.json({
+      issue: {
+        ...result.issue,
+        activeRecoveryAction: null,
+      },
+      recoveryAction: result.recoveryAction,
     });
   });
 
@@ -2243,7 +2507,7 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
-  router.post("/companies/:companyId/issues", validate(createIssueSchema), async (req, res) => {
+  router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
@@ -2283,6 +2547,7 @@ export function issueRoutes(
       details: {
         title: issue.title,
         identifier: issue.identifier,
+        ...buildCreateIssueActivityStatusDetails(issue, res),
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...summarizeIssueReferenceActivityDetails({
           addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
@@ -2332,7 +2597,7 @@ export function issueRoutes(
     });
   });
 
-  router.post("/issues/:id/children", validate(createChildIssueSchema), async (req, res) => {
+  router.post("/issues/:id/children", applyCreateIssueStatusDefault, validate(createChildIssueSchema), async (req, res) => {
     const parentId = req.params.id as string;
     const parent = await svc.getById(parentId);
     if (!parent) {
@@ -2374,6 +2639,7 @@ export function issueRoutes(
         parentId: parent.id,
         identifier: issue.identifier,
         title: issue.title,
+        ...buildCreateIssueActivityStatusDetails(issue, res),
         inheritedExecutionWorkspaceFromIssueId: parent.id,
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...(parentBlockerAdded ? { parentBlockerAdded: true } : {}),
@@ -2436,6 +2702,44 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const actor = getActorInfo(req);
+    const result = await heartbeat.retryScheduledRetryNow({
+      issueId: issue.id,
+      actor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+      },
+    });
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      action: "issue.scheduled_retry_retry_now",
+      entityType: "issue",
+      entityId: issue.id,
+      agentId: result.scheduledRetry?.agentId ?? issue.assigneeAgentId ?? null,
+      runId: result.scheduledRetry?.runId ?? null,
+      details: {
+        outcome: result.outcome,
+        message: result.message,
+        scheduledRetry: result.scheduledRetry,
+      },
+    });
+
+    res.json(result);
   });
 
   router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
