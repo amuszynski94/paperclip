@@ -1,3 +1,4 @@
+import { agentAppearanceSchema } from "@paperclipai/shared";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
@@ -22,6 +23,13 @@ export function approvalService(db: Db) {
       ...comment,
       body: redactCurrentUserText(comment.body, { enabled: censorUsernameInLogs }),
     };
+  }
+
+  async function reconcileApprovedBuiltInAgent(companyId: string, payload: Record<string, unknown>) {
+    const sourceBuiltInAgentKey = typeof payload.sourceBuiltInAgentKey === "string" ? payload.sourceBuiltInAgentKey : null;
+    if (!sourceBuiltInAgentKey) return;
+    const { builtInAgentService } = await import("./built-in-agents.js");
+    await builtInAgentService(db).ensure(companyId, sourceBuiltInAgentKey);
   }
 
   async function getExistingApproval(id: string) {
@@ -114,6 +122,25 @@ export function approvalService(db: Db) {
         .returning()
         .then((rows) => rows[0]),
 
+    // Cancel an open (pending/revision_requested) approval without a board
+    // decision — e.g. when its paired agent is terminated during duplicate
+    // cleanup. Idempotent: a no-op on already-resolved approvals.
+    cancel: async (id: string, reason?: string | null) => {
+      const now = new Date();
+      const updated = await db
+        .update(approvals)
+        .set({
+          status: "cancelled",
+          decisionNote: reason ?? null,
+          decidedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return updated;
+    },
+
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const { approval: updated, applied } = await resolveApproval(
         id,
@@ -128,11 +155,13 @@ export function approvalService(db: Db) {
         const payload = updated.payload as Record<string, unknown>;
         const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
         if (payloadAgentId) {
-          await agentsSvc.activatePendingApproval(payloadAgentId);
+          await agentsSvc.activatePendingApproval(payloadAgentId, payload);
+          await reconcileApprovedBuiltInAgent(updated.companyId, payload);
           hireApprovedAgentId = payloadAgentId;
         } else {
           const created = await agentsSvc.create(updated.companyId, {
             name: String(payload.name ?? "New Agent"),
+            appearance: payload.appearance == null ? undefined : agentAppearanceSchema.parse(payload.appearance),
             role: String(payload.role ?? "general"),
             title: typeof payload.title === "string" ? payload.title : null,
             reportsTo: typeof payload.reportsTo === "string" ? payload.reportsTo : null,

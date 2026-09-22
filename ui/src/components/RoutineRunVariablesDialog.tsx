@@ -1,3 +1,4 @@
+import { AgentAvatar } from "@/components/AgentAvatar";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
@@ -12,7 +13,6 @@ import { useQuery } from "@tanstack/react-query";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { queryKeys } from "../lib/queryKeys";
 import { IssueWorkspaceCard } from "./IssueWorkspaceCard";
-import { AgentIcon } from "./AgentIconPicker";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
@@ -151,6 +151,10 @@ function applyWorkspaceDraft(
 
 function isMissingRequiredValue(value: unknown) {
   return value == null || (typeof value === "string" && value.trim().length === 0);
+}
+
+function shouldUseDateInput(variable: RoutineVariable) {
+  return variable.type === "date";
 }
 
 function supportsRoutineRunWorkspaceSelection(
@@ -319,15 +323,17 @@ export function RoutineRunVariablesDialog({
   }, []);
 
   const handleWorkspaceDraftChange = useCallback((
-    data: Record<string, unknown>,
+    data: Record<string, unknown> | null,
     meta: { canSave: boolean; workspaceBranchName?: string | null },
   ) => {
-    setWorkspaceConfig((current) => applyWorkspaceDraft(current, data));
+    if (data) {
+      setWorkspaceConfig((current) => applyWorkspaceDraft(current, data));
+    }
     setWorkspaceConfigValid((current) => (current === meta.canSave ? current : meta.canSave));
     setWorkspaceBranchName((current) => {
       const defaultWorkspaceBranchName = defaultExecutionWorkspace?.branchName ?? null;
       const next = meta.workspaceBranchName
-        ?? (data.executionWorkspaceId === defaultExecutionWorkspace?.id ? defaultWorkspaceBranchName : null)
+        ?? (data?.executionWorkspaceId === defaultExecutionWorkspace?.id ? defaultWorkspaceBranchName : null)
         ?? null;
       return current === next ? current : next;
     });
@@ -335,7 +341,7 @@ export function RoutineRunVariablesDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => !isPending && onOpenChange(next)}>
-      <DialogContent className="flex h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] max-w-xl flex-col gap-0 overflow-hidden p-0 sm:h-auto sm:max-h-[min(calc(100dvh-2rem),42rem)]">
+      <DialogContent className="flex h-(--sz-calc-18) max-h-(--sz-calc-18) max-w-xl flex-col gap-0 overflow-hidden p-0 sm:h-auto sm:max-h-(--sz-calc-20)">
         <DialogHeader className="shrink-0 border-b border-border/60 px-6 pb-4 pr-12 pt-6">
           {routineName && (
             <p className="text-muted-foreground text-sm">{routineName}</p>
@@ -368,7 +374,7 @@ export function RoutineRunVariablesDialog({
                   option ? (
                     currentAssignee ? (
                       <>
-                        <AgentIcon icon={currentAssignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <AgentAvatar agent={currentAssignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>
                         <span className="truncate">{option.label}</span>
                       </>
                     ) : (
@@ -383,7 +389,7 @@ export function RoutineRunVariablesDialog({
                   const assignee = agents.find((agent) => agent.id === option.id);
                   return (
                     <>
-                      {assignee ? <AgentIcon icon={assignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {assignee ? <AgentAvatar agent={assignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                       <span className="truncate">{option.label}</span>
                     </>
                   );
@@ -419,7 +425,7 @@ export function RoutineRunVariablesDialog({
                     <>
                       <span
                         className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                        style={{ backgroundColor: selectedProject.color ?? "#64748b" }}
+                        style={{ backgroundColor: selectedProject.color ?? "var(--project-none)" }}
                       />
                       <span className="truncate">{option.label}</span>
                     </>
@@ -434,7 +440,7 @@ export function RoutineRunVariablesDialog({
                     <>
                       <span
                         className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                        style={{ backgroundColor: project?.color ?? "#64748b" }}
+                        style={{ backgroundColor: project?.color ?? "var(--project-none)" }}
                       />
                       <span className="truncate">{option.label}</span>
                     </>
@@ -497,6 +503,12 @@ export function RoutineRunVariablesDialog({
                     ))}
                   </SelectContent>
                 </Select>
+              ) : shouldUseDateInput(variable) ? (
+                <Input
+                  type="date"
+                  value={values[variable.name] == null ? "" : String(values[variable.name])}
+                  onChange={(event) => setValues((current) => ({ ...current, [variable.name]: event.target.value }))}
+                />
               ) : (
                 <Input
                   type={variable.type === "number" ? "number" : "text"}
@@ -522,7 +534,7 @@ export function RoutineRunVariablesDialog({
 
         <DialogFooter
           showCloseButton={false}
-          className="shrink-0 border-t border-border/60 bg-background px-6 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-4"
+          className="shrink-0 border-t border-border/60 bg-background px-6 pb-(--sz-calc-19) pt-4"
         >
           {!selection.assigneeAgentId ? (
             <p className="mr-auto text-xs text-amber-600">Default agent required for this run.</p>
