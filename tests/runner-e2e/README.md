@@ -985,3 +985,33 @@ Current proof and remaining decisions are recorded in
 the original worker-loss attempts quarantined both providers. The version 9 crash
 eval requires a usable fresh conversation after verified cleanup. A passing
 quarantine guard alone is not a recovered workflow.
+
+### Blank-page investigation
+
+Private `browser-diagnostics.json` includes the final document readiness, whether
+`#root` mounted content, whether a service worker controls the page, outstanding
+script/style paths, and recent module 304/error statuses. These fields contain no
+response bodies, headers, or query strings. A 304 is ordinary cache validation;
+recording it does not change the grade or retry the page. The public report still
+uses the existing evidence allowlist.
+
+The provider-free `tests/e2e/task-reload.spec.ts` regression opens a persisted task
+with the production service worker, navigates to the same URL, and reloads it. It
+requires the saved content and usable composer to remain visible. Run it with the
+standard `tests/e2e/playwright.config.ts`; no provider or Daytona credentials are
+needed. Browser-support tests separately exercise blank-root/pending-module
+failure evidence, so a future blank page is distinguishable from a loaded task.
+
+### Grok branch qualification on EC2
+
+The trusted default-branch workflow can run the explicit `grok-qualification`
+suite from a selected target branch. Store `XAI_API_KEY` only in the protected
+`runner-e2e-paid` environment. The paid step delivers it only to a profile whose
+credential name is `XAI_API_KEY`. The Grok `build-revise` cells prepare the same
+pinned Python artifact verifier used by Everyday Workflows, before credentials
+are exposed. Local Grok cells also run the checksum-verifying binary installer
+before receiving credentials. With `RUNNER_E2E_AWS_ENABLED=true`, the controller, browser and
+artifact verifier run on the existing EC2 fleet; no developer laptop Docker
+service is required. Set the optional `max_parallel` dispatch input to `1` for
+keys with low request limits. It can only lower the configured campaign limit.
+Keep subscription qualification separate from API-key results.
