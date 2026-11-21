@@ -1954,12 +1954,14 @@ fn preserve_bounded_display_content(
     // change complete output into a truncated artifact without its metadata.
     if has_bounded_rich_display_shape(event_type, original) {
         let preserved = sanitize_bounded_display_value(original);
-        if !has_bounded_rich_display_shape(event_type, &preserved) {
-            return Err(DurableRunnerError::invalid(
-                "redacted display activity exceeds its schema bounds",
-            ));
+        if has_bounded_rich_display_shape(event_type, &preserved) {
+            return Ok(preserved);
         }
-        return Ok(preserved);
+        // Redaction can push a payload past its schema (a "[REDACTED]" marker
+        // is longer than a short secret, or replaces a structured value). Keep
+        // the generic redacted preview, as for a payload that never fit: an
+        // error here would exit runnerd and kill every live run on it.
+        return Ok(sanitized);
     }
     if matches!(
         event_type,
@@ -2727,6 +2729,30 @@ mod tests {
             preserve_bounded_display_content("plan.proposed", &payload, sanitize_value(&payload))
                 .unwrap();
         assert_eq!(stored["markdown"].as_str(), Some(markdown.as_str()));
+    }
+
+    #[test]
+    fn display_activity_that_redaction_pushes_past_its_schema_keeps_the_redacted_preview() {
+        use super::*;
+        let line = "password=hunter\n";
+        let mut markdown = String::new();
+        while markdown.len() + line.len() <= 60_000 {
+            markdown.push_str(line);
+        }
+        assert!(redact_sensitive_text_values(&markdown).len() > 60_000);
+        let payload = json!({
+            "schema": "paperclip.plan.proposed.v1",
+            "proposalId": "plan-1",
+            "status": "completed",
+            "markdown": markdown,
+            "source": "claude_exit_plan_mode",
+        });
+        let sanitized = sanitize_value(&payload);
+        let stored =
+            preserve_bounded_display_content("plan.proposed", &payload, sanitized.clone())
+                .expect("redaction past the schema bound must not fail the event");
+        assert_eq!(stored, sanitized);
+        assert!(!serde_json::to_string(&stored).unwrap().contains("hunter"));
     }
 
     #[test]
