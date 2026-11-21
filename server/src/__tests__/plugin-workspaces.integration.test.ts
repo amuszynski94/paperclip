@@ -20,6 +20,8 @@ import {
   type WorkspaceWorkers,
 } from "../services/plugin-workspaces.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
+import { WorkspaceProviderFailureError } from "../services/workspace-provider-failure.js";
+import { findPluginWorkerUnavailableError, PluginWorkerUnavailableError } from "../services/plugin-worker-unavailable-error.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { projectService } from "../services/projects.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
@@ -37,7 +39,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const started =
         await startEmbeddedPostgresTestDatabase("plugin-workspaces");
       db = createDb(started.connectionString, { maxConnections: 1 });
-      stopDb = started.stop;
+      stopDb = started.cleanup;
     });
     afterAll(async () => {
       await db?.$client.end();
@@ -45,6 +47,27 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     const fixture = (companyId?: string) =>
       createPluginWorkspaceFixture(db, companyId);
+    it.each([
+      ["missing", undefined],
+      ["stopped", { status: "stopped", supportedMethods: [] }],
+      ["starting", { status: "starting", supportedMethods: [] }],
+    ] as const)("retries preparation when the ready provider's worker is %s, before sending a request", async (_state, worker) => {
+      const f = await fixture();
+      const workers = { getWorker: () => worker, call: f.workers.call.bind(f.workers) } as unknown as WorkspaceWorkers;
+      const failure = await preparePluginWorkspace(db, workers, f.input).then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(WorkspaceProviderFailureError);
+      expect((failure as WorkspaceProviderFailureError).summary()).toEqual({ kind: "worker_unavailable", reason: null, retryable: true });
+      expect(findPluginWorkerUnavailableError(failure)).toBeInstanceOf(PluginWorkerUnavailableError);
+      expect(f.calls).toHaveLength(0);
+    });
+    it("keeps a running worker without workspace operations an unavailable provider", async () => {
+      const f = await fixture();
+      const workers = { getWorker: () => ({ status: "running", supportedMethods: [] }), call: f.workers.call.bind(f.workers) } as unknown as WorkspaceWorkers;
+      const failure = await preparePluginWorkspace(db, workers, f.input).then(() => null, (error: unknown) => error);
+      expect(failure).not.toBeInstanceOf(WorkspaceProviderFailureError);
+      expect((failure as Error).message).toBe("The workspace storage plugin is unavailable");
+      expect(f.calls).toHaveLength(0);
+    });
     it.each([1, undefined])("gates recovery hints by provider capability (%s)", async (version) => {
       const f = await fixture();
       const [plugin] = await db.select().from(plugins).where(eq(plugins.id, f.pluginId));
@@ -123,7 +146,7 @@ const support = await getEmbeddedPostgresTestSupport();
     it.each(["refs/heads/main", null, undefined])("persists the actual prepared destination (%s)", async (destinationRef) => {
       const f = await fixture();
       const workers: WorkspaceWorkers = { ...f.workers, call: async (...args: Parameters<typeof f.workers.call>) => {
-        const result = await f.workers.call(...args);
+        const result = await f.workers.call(...args) as { kind?: string };
         return result.kind === "prepared" ? { ...result, ...(destinationRef !== undefined ? { destinationRef } : {}) } : result;
       } };
       const workspace = await preparePluginWorkspace(db, workers, f.input);
@@ -416,9 +439,11 @@ const support = await getEmbeddedPostgresTestSupport();
           return call(...args);
         },
       } as unknown as WorkspaceWorkers;
+      let clock = Date.now();
       const svc = executionWorkspaceService(db, {
         pluginWorkerManager: workers,
         workspaceReaperCooldownDays: 0,
+        now: () => new Date(clock),
       });
       const sweep = () => svc.sweepTerminalWorkspaces(100);
       expect(await sweep()).toMatchObject({ cleanupFailed: 1 });
@@ -428,7 +453,10 @@ const support = await getEmbeddedPostgresTestSupport();
         .where(eq(executionWorkspaces.id, workspace!.id));
       expect(failed.status).toBe("cleanup_failed");
       expect(failed.metadata?.workspaceProviderRemoval).toBeUndefined();
-      expect(await svc.nextTerminalWorkspaceSweepAt()).not.toBeNull();
+      expect(failed.metadata?.terminalCleanupRetry).toMatchObject({ failures: 1, failure: { kind: "transport" },
+        retryAt: new Date(clock + 300_000).toISOString() });
+      expect(await sweep()).toMatchObject({ skippedBackoff: 1 });
+      clock += 300_000;
       await sweep();
       const [removed] = await db
         .select()
@@ -436,6 +464,7 @@ const support = await getEmbeddedPostgresTestSupport();
         .where(eq(executionWorkspaces.id, workspace!.id));
       expect(removed.metadata?.workspaceProviderRemoved).toBe(true);
       expect(removed.status).toBe("archived");
+      expect(removed.metadata).not.toHaveProperty("terminalCleanupRetry");
     });
     it("prepares a durable reference without a local checkout or agent allocation", async () => {
       const f = await fixture();
@@ -558,8 +587,10 @@ const support = await getEmbeddedPostgresTestSupport();
       const workspace = await preparePluginWorkspace(db, f.workers, f.input);
       const svc = projectService(db);
       await expect(
-        svc.update(f.input.projectId, { executionWorkspacePolicy: {} }),
-      ).rejects.toThrow("storage owner");
+        svc.update(f.input.projectId, {
+          executionWorkspacePolicy: { storageProviderPluginId: null },
+        }),
+      ).rejects.toThrow("stays attached");
       await expect(
         svc.updateWorkspace(f.input.projectId, f.input.projectWorkspaceId, {
           repoUrl: "https://github.com/example/other.git",
@@ -806,7 +837,7 @@ const support = await getEmbeddedPostgresTestSupport();
           .where(eq(issues.id, f.issueId));
       const workers = {
         getWorker: (id: string) =>
-          [first.pluginId, second.pluginId].includes(id)
+          ([first.pluginId, second.pluginId] as string[]).includes(id)
             ? { supportedMethods: ["workspaceOperation"] }
             : undefined,
         call: (id: string, ...args: unknown[]) =>
@@ -1151,7 +1182,7 @@ const support = await getEmbeddedPostgresTestSupport();
       second.dirty();
       const workers = {
         getWorker: (id: string) =>
-          [first.pluginId, second.pluginId].includes(id)
+          ([first.pluginId, second.pluginId] as string[]).includes(id)
             ? { supportedMethods: ["workspaceOperation"] }
             : undefined,
         call: (id: string, ...args: any[]) =>
