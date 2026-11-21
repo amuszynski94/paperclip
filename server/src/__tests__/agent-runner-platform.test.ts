@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const probe = vi.hoisted(() => ({ execFile: vi.fn() }));
-vi.mock("node:child_process", () => ({ execFile: probe.execFile }));
+const probe = vi.hoisted(() => ({ execFileSync: vi.fn() }));
+vi.mock("node:child_process", () => ({ execFileSync: probe.execFileSync }));
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const architecture = Object.getOwnPropertyDescriptor(process, "arch")!;
 
 beforeEach(() => {
   vi.resetModules();
-  probe.execFile.mockReset();
+  probe.execFileSync.mockReset();
   Object.defineProperty(process, "platform", { ...platform, value: "linux" });
   Object.defineProperty(process, "arch", { ...architecture, value: "x64" });
   vi.spyOn(process.report, "getReport").mockImplementation(() => {
@@ -22,8 +22,9 @@ afterEach(() => {
 });
 
 function reply(stdout: string, error: Error | null = null) {
-  probe.execFile.mockImplementation((_command, _args, _options, callback) => {
-    callback(error, stdout, "");
+  probe.execFileSync.mockImplementation(() => {
+    if (error) throw error;
+    return stdout;
   });
 }
 
@@ -44,23 +45,30 @@ describe("local runner platform probe", () => {
     expect(process.report.getReport).not.toHaveBeenCalled();
   });
 
-  it("probes once before discovery, with a bounded asynchronous command", async () => {
-    let callback!: (error: Error | null, stdout: string, stderr: string) => void;
-    probe.execFile.mockImplementation((_command, _args, _options, done) => { callback = done; });
-    const loaded = import("../lib/agent-runner-platform.js");
-    await vi.waitFor(() => expect(probe.execFile).toHaveBeenCalledTimes(1));
-    await new Promise<void>(resolve => setTimeout(resolve, 0));
-    callback(null, "glibc 2.41\n", "");
-    const module = await loaded;
+  it("probes once at module load, with a bounded command", async () => {
+    reply("glibc 2.41\n");
+    const module = await import("../lib/agent-runner-platform.js");
     const first = module.localAgentRunnerTarget();
     first.glibcVersion = "0.0";
     for (let index = 0; index < 10; index++) {
       expect(module.localAgentRunnerTarget().glibcVersion).toBe("2.41");
     }
-    expect(probe.execFile).toHaveBeenCalledTimes(1);
-    expect(probe.execFile).toHaveBeenCalledWith("getconf", ["GNU_LIBC_VERSION"], {
-      encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL", maxBuffer: 1_024,
-    }, expect.any(Function));
+    expect(probe.execFileSync).toHaveBeenCalledTimes(1);
+    expect(probe.execFileSync).toHaveBeenCalledWith("getconf", ["GNU_LIBC_VERSION"], {
+      encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL", maxBuffer: 1_024, stdio: ["ignore", "pipe", "ignore"],
+    });
+  });
+
+  it("detects glibc even when the event loop is blocked for longer than the probe timeout", async () => {
+    // Server startup can block the loop for seconds; an asynchronous probe's timer then fired
+    // before the child's exit was handled and libc stayed "unknown" until the next restart.
+    reply("glibc 2.41\n");
+    const loaded = import("../lib/agent-runner-platform.js");
+    const blockedUntil = Date.now() + 1_200;
+    while (Date.now() < blockedUntil) { /* simulate synchronous module evaluation elsewhere */ }
+    const module = await loaded;
+    expect(module.localAgentRunnerTarget()).toMatchObject({ libc: "glibc", glibcVersion: "2.41" });
+    expect(module.localPaperclipRunnerSupported()).toBe(true);
   });
 
   it.each(["", "musl 1.2.5", "glibc malformed", "glibc 2.39ubuntu1", "glibc 2.41\nprivate-data"])(
@@ -79,7 +87,7 @@ describe("local runner platform probe", () => {
       const module = await import("../lib/agent-runner-platform.js");
       expect(module.localAgentRunnerTarget()).toMatchObject({ libc: "unknown" });
       expect(module.localPaperclipRunnerSupported()).toBe(false);
-      expect(probe.execFile).toHaveBeenCalledTimes(1);
+      expect(probe.execFileSync).toHaveBeenCalledTimes(1);
     },
   );
 
@@ -87,6 +95,6 @@ describe("local runner platform probe", () => {
     Object.defineProperty(process, "platform", { ...platform, value });
     const module = await import("../lib/agent-runner-platform.js");
     expect(module.localAgentRunnerTarget()).toEqual({ driver: "local", platform: value, architecture: "x64" });
-    expect(probe.execFile).not.toHaveBeenCalled();
+    expect(probe.execFileSync).not.toHaveBeenCalled();
   });
 });

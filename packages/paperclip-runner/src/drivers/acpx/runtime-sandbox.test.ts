@@ -212,6 +212,27 @@ describe("ACPX runtime sandbox", () => {
     }
   });
 
+  it("keeps a configured per-agent Claude auto-memory directory in isolated settings", async () => {
+    const fixture = await sandboxFixture("claude");
+    const directory = "/paperclip/agents/agent-1/auto-memory";
+    const configured = (value: string) => ({
+      CLAUDE_AUTO_MEMORY_DIRECTORY: value,
+      PAPERCLIP_CONFIGURED_ENV_KEYS: JSON.stringify(["CLAUDE_AUTO_MEMORY_DIRECTORY"]),
+    });
+    const sandbox = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "claude", environment: configured(directory) });
+    await sandbox.initializeOwnedConfiguration?.();
+    expect(JSON.parse(await readFile(join(sandbox.agentHomeDirectory, "settings.json"), "utf8")))
+      .toMatchObject({ autoMemoryDirectory: directory });
+    // An ambient host value is not the agent's configuration.
+    const ambient = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "claude",
+      environment: { CLAUDE_AUTO_MEMORY_DIRECTORY: directory } });
+    await ambient.initializeOwnedConfiguration?.();
+    expect(JSON.parse(await readFile(join(ambient.agentHomeDirectory, "settings.json"), "utf8")))
+      .not.toHaveProperty("autoMemoryDirectory");
+    await expect(prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "claude", environment: configured("relative/memory") }))
+      .rejects.toThrow("claude_auto_memory_directory_invalid");
+  });
+
   it("restores bound Claude effort in private settings across cold connections", async () => {
     const fixture = await sandboxFixture("claude");
     for (const claudeEffort of ["high", "xhigh", "max"] as const) {

@@ -2,7 +2,7 @@ import { kimiManagedConfiguration } from "./kimi-config.js";
 import { kimiInstructionBinding } from "./kimi-instructions.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS, codexObservabilityToml } from "../agent-observability.js";
 import { piProviderConfiguration } from "./pi-provider-config.js";
-import { configuredEnvironmentKeys } from "../../configured-environment.js";
+import { configuredEnvironment, configuredEnvironmentKeys } from "../../configured-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
 import { preparedHarnessHome, preconfiguredHomeEnvironment, usesPreconfiguredHome } from "../preconfigured-home.js";
 import { randomBytes } from "node:crypto";
@@ -430,6 +430,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
     const configuration = piProviderConfiguration(input.environment);
     if (configuration) await writePrivateFile(join(agentHomeDirectory, "models.json"), configuration.json);
   }
+  const autoMemoryDirectory = input.agent === "claude" ? claudeAutoMemoryDirectory(input.environment) : undefined;
   const initializeOwnedConfiguration = input.agent === "claude" ? async () => {
     // ACP otherwise rewrites exact IDs (including user-entered model IDs) to
     // picker aliases such as "sonnet". Its supported availableModels setting
@@ -439,6 +440,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
       `${JSON.stringify({
         model: input.binding.requestedModel,
         availableModels: [input.binding.requestedModel],
+        ...(autoMemoryDirectory ? { autoMemoryDirectory } : {}),
         ...(input.binding.claudeEffort ? { effortLevel: input.binding.claudeEffort } : {}),
         ...((input.binding.permissionMode === "approve-reads" || input.binding.permissionMode === "approve-paperclip")
           ? { permissions: { allow: claudePaperclipPermissionRules(input.tools ?? [], input.binding.permissionMode) } }
@@ -609,6 +611,22 @@ export async function prepareAcpxRuntimeSandbox(input: {
     launchEnvironment: Object.freeze({ ...launchEnvironment }),
     persistedEnvironment: Object.freeze(persistedEnvironment),
   };
+}
+
+/**
+ * Claude Code reads autoMemoryDirectory only from settings files, and isolated
+ * Claude reads only the Runner-owned user settings. An agent that keeps one
+ * memory directory across tasks names it in its configured environment.
+ */
+export const CLAUDE_AUTO_MEMORY_DIRECTORY_ENV = "CLAUDE_AUTO_MEMORY_DIRECTORY";
+
+function claudeAutoMemoryDirectory(environment: NodeJS.ProcessEnv | undefined): string | undefined {
+  const value = configuredEnvironment(environment)[CLAUDE_AUTO_MEMORY_DIRECTORY_ENV]?.trim();
+  if (!value) return undefined;
+  if (!isAbsolute(value) || /[\0\r\n]/.test(value) || resolve(value) !== value) {
+    throw new Error("claude_auto_memory_directory_invalid");
+  }
+  return value;
 }
 
 async function validateProviderPolicy(policy: AcpxProviderRuntimePolicy | undefined): Promise<{

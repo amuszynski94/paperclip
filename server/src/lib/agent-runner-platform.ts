@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { paperclipRunnerSupportsPlatform } from "@paperclipai/shared";
 
 type LocalRunnerTarget = {
@@ -9,17 +9,18 @@ type LocalRunnerTarget = {
   glibcVersion?: string;
 };
 
-async function detectLocalRunnerTarget(): Promise<LocalRunnerTarget> {
+// Synchronous on purpose: an asynchronous probe's 1 s timer races the rest of server startup.
+// When module evaluation blocks the event loop for over a second, the timer fires before the
+// child's exit is handled, getconf is killed, and libc stays "unknown" until the next restart.
+function detectLocalRunnerTarget(): LocalRunnerTarget {
   const target: LocalRunnerTarget = {
     driver: "local", platform: process.platform, architecture: process.arch,
   };
   if (target.platform !== "linux") return target;
   target.libc = "unknown";
   try {
-    const stdout = await new Promise<string>((resolve, reject) => {
-      execFile("getconf", ["GNU_LIBC_VERSION"], {
-        encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL", maxBuffer: 1_024,
-      }, (error, output) => error ? reject(error) : resolve(output));
+    const stdout = execFileSync("getconf", ["GNU_LIBC_VERSION"], {
+      encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL", maxBuffer: 1_024, stdio: ["ignore", "pipe", "ignore"],
     });
     const version = /^glibc\s+(\d+\.\d+(?:\.\d+)?)$/.exec(stdout.trim())?.[1];
     if (version) {
@@ -30,7 +31,7 @@ async function detectLocalRunnerTarget(): Promise<LocalRunnerTarget> {
   return target;
 }
 
-const localTarget = await detectLocalRunnerTarget();
+const localTarget = detectLocalRunnerTarget();
 
 export function localAgentRunnerTarget(): LocalRunnerTarget {
   return { ...localTarget };
