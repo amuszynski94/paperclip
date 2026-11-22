@@ -1,8 +1,23 @@
 diff --git a/dist/acp-agent.js b/dist/acp-agent.js
-index 0214a50..73f0c16 100644
+index 0214a50..5509866 100644
 --- a/dist/acp-agent.js
 +++ b/dist/acp-agent.js
-@@ -2490,11 +2490,88 @@ export class ClaudeAcpAgent {
+@@ -2202,7 +2202,13 @@ export class ClaudeAcpAgent {
+                                 // The "Compacting completed." text is emitted from the `status`
+                                 // handler (keyed on `compact_result`), not here, so the failure
+                                 // path gets a message too.
+-                                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
++                                // Paperclip patch (backport of upstream 0.109): never await a
++                                // getContextUsage control request inside this message loop. Mid-turn
++                                // after an auto-compaction the CLI does not answer it, the loop stops
++                                // consuming SDK messages and the whole prompt turn stalls until the
++                                // runner's lease kills it. The boundary frame carries post_tokens.
++                                const postTokens = message.compact_metadata?.post_tokens;
++                                const usedTokens = typeof postTokens === "number" && postTokens >= 0 ? postTokens : null;
+                                 lastAssistantUsage = null;
+                                 lastAssistantTotalUsage = usedTokens ?? 0;
+                                 session.contextUsedTokens = usedTokens ?? 0;
+@@ -2490,11 +2496,88 @@ export class ClaudeAcpAgent {
                                  break;
                              }
                              case "hook_started":
@@ -93,7 +108,7 @@ index 0214a50..73f0c16 100644
                                  await asyncTasks.taskProgress({
                                      task_id: message.task_id,
                                      description: message.description,
-@@ -2503,6 +2580,7 @@ export class ClaudeAcpAgent {
+@@ -2503,6 +2586,7 @@ export class ClaudeAcpAgent {
                                      usage: message.usage,
                                  });
                                  break;
@@ -101,7 +116,7 @@ index 0214a50..73f0c16 100644
                              case "task_started":
                                  // For subagent tasks `task_id` is the subagent's agent id (the
                                  // SDK keys its task registry by agent id) and `tool_use_id` is
-@@ -2550,6 +2628,7 @@ export class ClaudeAcpAgent {
+@@ -2550,6 +2634,7 @@ export class ClaudeAcpAgent {
                              case "task_notification":
                                  // The task settled — no further tool calls can originate
                                  // from it, so its registry entry can be dropped.
@@ -109,7 +124,7 @@ index 0214a50..73f0c16 100644
                                  await subagents.finishTask(message.task_id, message.status, sendUpdate, message.tool_use_id);
                                  await asyncTasks.taskNotification({
                                      task_id: message.task_id,
-@@ -2571,6 +2650,7 @@ export class ClaudeAcpAgent {
+@@ -2571,6 +2656,7 @@ export class ClaudeAcpAgent {
                                  if (message.patch.status === "completed" ||
                                      message.patch.status === "failed" ||
                                      message.patch.status === "killed") {
@@ -117,7 +132,7 @@ index 0214a50..73f0c16 100644
                                      await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
                                      session.liveBackgroundTasks.delete(message.task_id);
                                  }
-@@ -2922,9 +3002,19 @@ export class ClaudeAcpAgent {
+@@ -2922,9 +3008,19 @@ export class ClaudeAcpAgent {
                                              amount: message.total_cost_usd,
                                              currency: "USD",
                                          },
@@ -140,7 +155,7 @@ index 0214a50..73f0c16 100644
                                      },
                                  });
                              }
-@@ -4506,6 +4596,48 @@ export class ClaudeAcpAgent {
+@@ -4506,6 +4602,48 @@ export class ClaudeAcpAgent {
       *  `$/cancel_request`, and our local abort race settles even if the client
       *  ignores it. A `cancelled` outcome, request rejection, and local abort all
       *  surface the same "Tool use aborted" the callers already expect. */
@@ -189,7 +204,7 @@ index 0214a50..73f0c16 100644
      async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {
          if (signal.aborted)
              throw new Error("Tool use aborted");
-@@ -5311,14 +5443,24 @@ export class ClaudeAcpAgent {
+@@ -5311,14 +5449,24 @@ export class ClaudeAcpAgent {
              settingSources: ["user", "project", "local"],
              ...(thinking !== undefined && { thinking }),
              ...userProvidedOptions,
@@ -215,7 +230,7 @@ index 0214a50..73f0c16 100644
                  ...mcpServers,
                  ...(fileChangeAuditSupport
                      ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
-@@ -5329,6 +5471,16 @@ export class ClaudeAcpAgent {
+@@ -5329,6 +5477,16 @@ export class ClaudeAcpAgent {
              allowDangerouslySkipPermissions: ALLOW_BYPASS,
              permissionMode: initialPermissionMode,
              canUseTool: this.canUseTool(sessionId),
