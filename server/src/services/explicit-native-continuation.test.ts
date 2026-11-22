@@ -101,13 +101,17 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       comment: "process_identity_missing", retry: "process_identity_missing" },
     { shape: "failed for another reason without a process record", errorCode: "adapter_failed", launched: false,
       comment: "process_identity_missing", retry: "process_identity_missing" },
-  ])("routes input after a run $shape to the gate that can clear it", async ({ errorCode, launched, comment, retry }) => {
+    { shape: "refused by attachment staging after it requested a launch", errorCode: "adapter_failed", launched: true,
+      error: "paperclip_runner_attachment_staging_not_authorized", comment: "process_identity_missing", retry: "process_identity_missing" },
+    { shape: "whose attachment staging cleanup failed", errorCode: "adapter_failed", launched: false,
+      error: "paperclip_runner_attachment_staging_cleanup_failed", comment: "process_identity_missing", retry: "process_identity_missing" },
+  ])("routes input after a run $shape to the gate that can clear it", async ({ errorCode, launched, comment, retry, error }) => {
     // s7532/t04: a Retry's run failed at the quarantine fence before it asked
     // for a runner. Input then waited for a stop record of a process that
     // never existed ("process_identity_missing", Retry still offered) instead
     // of the quarantine's own gate, which names the action that clears it.
     const f = await seed();
-    await db.update(heartbeatRuns).set({ processPid: null, errorCode }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ processPid: null, errorCode, error: error ?? null }).where(eq(heartbeatRuns.id, f.sourceRunId));
     if (launched) await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.sourceRunId, agentId: f.agentId,
       seq: 1, eventType: "native.process_start_requested", stream: "system", level: "info", message: "launch requested",
       payload: { hostname: "another-host" } });
@@ -118,6 +122,23 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(await admitExplicitNativeContinuation({ ...f, db, dryRun: true, reason: "retry_failed_run",
       failedRunId: f.sourceRunId, onBlocked: reason => retryBlocked.push(reason) })).toBeNull();
     expect(retryBlocked).toEqual([retry]);
+  });
+
+  it("needs no stop proof after attachment staging refused a run before launch", async () => {
+    // AMP-568: a status change released the run's issue lock while it was
+    // starting; attachment staging refused it before any launch request. Retry
+    // and input then waited forever for a stop record of a process that never
+    // existed.
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ processPid: null, errorCode: "adapter_failed",
+      error: "paperclip_runner_attachment_staging_not_authorized" }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const { blocked } = await readAdmission(f, false);
+    expect(blocked).not.toContain("process_identity_missing");
+    const retryBlocked: string[] = [];
+    const retry = await admitExplicitNativeContinuation({ ...f, db, dryRun: true, reason: "retry_failed_run",
+      failedRunId: f.sourceRunId, onBlocked: reason => retryBlocked.push(reason) });
+    expect(retryBlocked).toEqual([]);
+    expect(retry).not.toBeNull();
   });
 
   it("keeps admission and the complete locked session profile while omitting prompt data", async () => {

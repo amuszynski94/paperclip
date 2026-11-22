@@ -144,13 +144,19 @@ export async function recordUnidentifiedLocalRunnerStop(db: Db, run: Pick<typeof
 }
 
 /** A native run that an admission fence refused before it requested any
- * runner launch (a quarantined prior-session cleanup is checked before the
- * provider starts) never had a process: there is nothing to stop. Any launch
- * request or identity record keeps the normal stop proofs. */
+ * runner launch never had a process: there is nothing to stop. Two fences run
+ * before the launch request: the quarantined prior-session cleanup check, and
+ * wake-attachment staging (it refuses a run that lost its issue execution
+ * lock, e.g. after a status change released it). Staging's own cleanup failure
+ * is excluded: it may leave files behind. Any launch request or identity
+ * record keeps the normal stop proofs. */
+const PRE_LAUNCH_STAGING_REFUSAL = /^paperclip_runner_attachment_staging_(?!cleanup_failed)/;
 export async function nativeRunRefusedBeforeLaunch(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
-  "id" | "companyId" | "runtimeMode" | "status" | "errorCode" | "processPid" | "processGroupId">): Promise<boolean> {
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid || run.processGroupId ||
-      run.errorCode !== "native_session_cleanup_quarantined") return false;
+  "id" | "companyId" | "runtimeMode" | "status" | "errorCode" | "error" | "processPid" | "processGroupId">): Promise<boolean> {
+  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid || run.processGroupId) return false;
+  const refused = run.errorCode === "native_session_cleanup_quarantined" ||
+    (run.errorCode === "adapter_failed" && PRE_LAUNCH_STAGING_REFUSAL.test(run.error ?? ""));
+  if (!refused) return false;
   const [launch] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
     inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED]),
