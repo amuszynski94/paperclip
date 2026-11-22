@@ -1600,7 +1600,12 @@ fn sensitive_key(key: &str, value: &Value) -> bool {
             | "pretokens"
             | "posttokens"
     ) {
-        return !value.is_number();
+        // A null counter carries nothing to leak, and the schemas allow it
+        // (`context.compacted` sends null pre/post tokens for ACPX). Turning
+        // it into "[REDACTED]" broke schema validation, so the controller
+        // rejected the event, runnerd resent it in a reconnect loop and the
+        // run died when its connection lease expired.
+        return !value.is_number() && !value.is_null();
     }
     let credential_name = [
         "value",
@@ -3286,8 +3291,11 @@ mod tests {
             "cachedWriteTokens",
             "thoughtTokens",
             "totalTokens",
+            "preTokens",
+            "postTokens",
         ] {
             assert_eq!(sanitize_value(&json!({key: 12})), json!({key: 12}));
+            assert_eq!(sanitize_value(&json!({key: null})), json!({key: null}));
             for value in [
                 json!("plain-provider-secret"),
                 json!({"value":"secret"}),
