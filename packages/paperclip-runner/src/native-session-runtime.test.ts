@@ -44,6 +44,7 @@ import {
   completeTerminatedLocalNativeSessionCleanup,
   nativeSessionCleanupBlock,
   onNativeSessionCleanupQuarantined,
+  unrecoverableCloseProvesRetirement,
   type ExecuteNativeSessionOptions,
 } from "./native-session-runtime.js";
 
@@ -5387,6 +5388,80 @@ describe("executeNativeSession recovery", () => {
     expect(backend.openSession).toHaveBeenCalledTimes(2);
     expect(controlPlane.completeRun).not.toHaveBeenCalled();
     completeTerminatedLocalNativeSessionCleanup(binding);
+  });
+
+  describe("fork: unrecoverable close whose owner provably retired", () => {
+    const retired = {
+      runnerSuspended: true, providerDrained: false, suspensionState: null,
+      finalProviderState: { pendingEventCount: 0, providerSettled: true },
+      retainedProcessesAbsent: true,
+    };
+
+    it("accepts only a suspended, settled, tool-clean close with every process gone", () => {
+      expect(unrecoverableCloseProvesRetirement(new NativeSessionCloseUnrecoverableError(retired, true))).toBe(true);
+      expect(unrecoverableCloseProvesRetirement(new NativeSessionCloseUnrecoverableError(
+        { ...retired, finalProviderState: null }, true))).toBe(true);
+      for (const settlement of [
+        { ...retired, retainedProcessesAbsent: false },
+        { ...retired, retainedProcessesAbsent: undefined },
+        { ...retired, runnerSuspended: false },
+        { ...retired, finalProviderState: "unreadable" },
+        { ...retired, finalProviderState: { pendingEventCount: 1, providerSettled: true } },
+        { ...retired, finalProviderState: { pendingEventCount: 0, providerSettled: false } },
+      ]) {
+        expect(unrecoverableCloseProvesRetirement(new NativeSessionCloseUnrecoverableError(settlement, true))).toBe(false);
+      }
+      expect(unrecoverableCloseProvesRetirement(new NativeSessionCloseUnrecoverableError(retired, false))).toBe(false);
+      expect(unrecoverableCloseProvesRetirement(new NativeSessionCloseUnrecoverableError(undefined, true))).toBe(false);
+      expect(unrecoverableCloseProvesRetirement(new Error("other"))).toBe(false);
+    });
+
+    const runScoped = async (suffix: string, settlement: Record<string, unknown>) => {
+      const scopedIdentity = { ...identity, companyId: `retired-${suffix}-company`, runId: `retired-${suffix}-run` };
+      const scopedInput = { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId: scopedIdentity.runId } };
+      const failure = new NativeSessionCloseUnrecoverableError(settlement, true);
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+      const session: NativeSession = {
+        identity: () => scopedIdentity, capabilities: async () => capabilities,
+        async *events() { throw new Error(`${suffix} transport stopped`); },
+        startTurn: async () => ({ turnId: `${suffix}-turn` }), result: async () => null,
+        async snapshot() { return { backendKind: "mock", sessionId: `${suffix}-session`, identity: this.identity(),
+          providerSessionId: `${suffix}-provider`, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; },
+        close: vi.fn(async () => { throw failure; }),
+      };
+      const backend: NativeSessionBackend = {
+        descriptor: async () => ({ kind: "runner", name: `${suffix}-backend`, version: "1", capabilities }),
+        openSession: vi.fn(async () => session),
+      };
+      const options = { input: scopedInput, backend, runnerInstanceId: `${suffix}-runner`,
+        controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true,
+        controlPlane: { openRun: async () => {}, checkpointSession: async () => {},
+          appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" as const }),
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: async () => {} } };
+      await expect(executeNativeSession(options)).rejects.toMatchObject({ message: `${suffix} transport stopped`, cleanupError: failure });
+      const binding = { companyId: scopedIdentity.companyId, runId: scopedIdentity.runId, runnerInstanceId: `${suffix}-runner` };
+      return { options, backend, failure, binding };
+    };
+
+    it("lets the next run start without a server restart", async () => {
+      const { options, backend, failure, binding } = await runScoped("gone", retired);
+      try {
+        await expect(executeNativeSession(options)).rejects.toMatchObject({ message: "gone transport stopped", cleanupError: failure });
+        expect(backend.openSession).toHaveBeenCalledTimes(2);
+      } finally {
+        completeTerminatedLocalNativeSessionCleanup(binding);
+      }
+    });
+
+    it("still requires an operator while a retained process may be alive", async () => {
+      const { options, backend, binding } = await runScoped("alive", { ...retired, retainedProcessesAbsent: false });
+      try {
+        await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+        expect(backend.openSession).toHaveBeenCalledOnce();
+      } finally {
+        completeTerminatedLocalNativeSessionCleanup(binding);
+      }
+    });
   });
 
   it("announces every cleanup quarantine with its cause when it is created", async () => {

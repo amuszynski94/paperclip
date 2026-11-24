@@ -1168,6 +1168,82 @@ it("waits for a fresh empty provider suffix after a confirmed drain receipt", as
   expect(commands).toHaveLength(2);
 });
 
+describe("fork: retained process absence", () => {
+  it("needs at least one recorded PID and every one absent", () => {
+    const { retainedProcessesAbsent } = runnerdRecoveryInternals;
+    expect(retainedProcessesAbsent([], () => true)).toBe(false);
+    expect(retainedProcessesAbsent([10, 11], () => true)).toBe(true);
+    expect(retainedProcessesAbsent([10, 11], (pid) => pid !== 11)).toBe(false);
+  });
+});
+
+describe("fork: drain proof from a suspended durable runner state", () => {
+  const identity = {
+    runnerInstanceId: "runner-1",
+    environmentLeaseId: "lease-1",
+    runId: "run-1",
+    normalizedSessionId: "session-1",
+    turnId: "turn-1",
+    itemId: "item-1",
+  };
+  // The live AMP-589 close: the drain receipt was still pending at its 5 s
+  // budget, but the runner then suspended with everything delivered.
+  const suspended = () => ({
+    schema: "paperclip.runner.durable.state.v1",
+    ...identity,
+    lifecycle: "suspended",
+    outbox: [],
+    ackedSourceSeq: 3140,
+    nextSourceSeq: 3141,
+    pendingTerminalDelivery: null,
+  });
+  const settledProvider = {
+    pendingEventCount: 0,
+    activeProviderTurnId: null,
+    providerSettled: true,
+  };
+  const prove = (
+    runnerState: Record<string, unknown>,
+    overrides: Partial<{ providerState: unknown; semanticResultsSettled: boolean }> = {},
+  ) =>
+    runnerdRecoveryInternals.durableSuspensionProvesProviderDrain({
+      runnerState,
+      identity,
+      providerState: ("providerState" in overrides ? overrides.providerState : settledProvider) as never,
+      semanticResultsSettled: overrides.semanticResultsSettled ?? true,
+    });
+
+  it("proves the drain of a suspended runner that delivered and ACKed everything", () => {
+    expect(prove(suspended())).toBe(true);
+  });
+
+  it.each([
+    ["an unsent outbox event", { outbox: [{ sourceSeq: 3141 }] }],
+    ["an unACKed event", { ackedSourceSeq: 3139 }],
+    ["a pending terminal delivery", { pendingTerminalDelivery: { sourceSeq: 3140 } }],
+    ["a ready runner", { lifecycle: "ready" }],
+    ["another run's identity", { runId: "run-2" }],
+    ["another schema", { schema: "paperclip.runner.durable.state.v0" }],
+    ["a malformed outbox", { outbox: undefined }],
+    ["a malformed sequence", { nextSourceSeq: "3141" }],
+  ])("refuses %s", (_label, patch) => {
+    expect(prove({ ...suspended(), ...patch })).toBe(false);
+  });
+
+  it.each([
+    ["a retained provider event", { ...settledProvider, pendingEventCount: 1 }],
+    ["an active provider turn", { ...settledProvider, activeProviderTurnId: "t", providerSettled: false }],
+    ["an unreadable provider state", "unreadable"],
+    ["a remote root without a local provider state", null],
+  ])("refuses %s", (_label, providerState) => {
+    expect(prove(suspended(), { providerState })).toBe(false);
+  });
+
+  it("refuses while an admitted tool result is unsettled", () => {
+    expect(prove(suspended(), { semanticResultsSettled: false })).toBe(false);
+  });
+});
+
 it("refuses a reusable close checkpoint when the local provider snapshot is unreadable", async () => {
   const stateDirectory = await mkdtemp(
     join(tmpdir(), "runnerd-close-unreadable-"),

@@ -850,12 +850,50 @@ function announceCleanupQuarantine(
   }
 }
 
+/**
+ * fork: an unrecoverable close needs an operator only while something may
+ * still own the session. When the runner proved suspension, the provider
+ * suffix is settled, every admitted tool has a durable result and the close
+ * owner proved that every retained process and group is gone, nothing is left
+ * to clean up: a server restart (the documented recovery) would change
+ * nothing but the in-memory gate. AMP-553/577/578/589 needed manual restarts.
+ */
+export function unrecoverableCloseProvesRetirement(cause: unknown): boolean {
+  if (!(cause instanceof NativeSessionCloseUnrecoverableError)) return false;
+  if (!cause.semanticToolsSettled) return false;
+  const settlement = cause.settlement;
+  if (!settlement || typeof settlement !== "object") return false;
+  if (settlement.runnerSuspended !== true) return false;
+  if (settlement.retainedProcessesAbsent !== true) return false;
+  const provider = settlement.finalProviderState;
+  if (provider === null) return true;
+  return (
+    typeof provider === "object" &&
+    provider !== undefined &&
+    (provider as Record<string, unknown>).pendingEventCount === 0 &&
+    (provider as Record<string, unknown>).providerSettled === true
+  );
+}
+
 function quarantineSessionCleanup(
   session: NativeSession,
   cleanupDomain: NativeSessionCleanupDomain,
   operatorRecoveryRequired = false,
   cause?: unknown,
 ): void {
+  if (operatorRecoveryRequired && unrecoverableCloseProvesRetirement(cause)) {
+    // Still announce it (logged), but do not gate later runs on it.
+    announceCleanupQuarantine(session, false, cause);
+    const retired = [...quarantinedSessionCleanups].find(
+      (entry) => entry.session === session,
+    );
+    if (retired) {
+      if (retired.timer) clearTimeout(retired.timer);
+      quarantinedSessionCleanups.delete(retired);
+    }
+    announceCleanupSettled(cleanupDomain);
+    return;
+  }
   const existing = [...quarantinedSessionCleanups].find(
     (entry) => entry.session === session,
   );
@@ -925,7 +963,10 @@ function startQuarantinedSessionCleanupRecovery(
         quarantinedSessionCleanups.delete(cleanup);
         announceCleanupSettled(cleanup.domain);
       } catch (error) {
-        if (error instanceof NativeSessionCloseUnrecoverableError) {
+        if (unrecoverableCloseProvesRetirement(error)) {
+          quarantinedSessionCleanups.delete(cleanup);
+          announceCleanupSettled(cleanup.domain);
+        } else if (error instanceof NativeSessionCloseUnrecoverableError) {
           if (!cleanup.operatorRecoveryRequired)
             announceCleanupQuarantine(cleanup.session, true, error);
           cleanup.operatorRecoveryRequired = true;

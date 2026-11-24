@@ -735,6 +735,43 @@ function providerDrainStateFromSnapshot(state: Record<string, unknown>): {
 type ProviderDrainState =
   ReturnType<typeof providerDrainStateFromSnapshot> | "unreadable" | null;
 
+/**
+ * fork: proof of a drained provider suffix from durable state, for a runner
+ * that already proved its suspension. It mirrors the runner's own
+ * `retainedEventsDrained` receipt (empty outbox, every event ACKed, no
+ * retained provider event) and adds the suspension, identity and
+ * terminal-delivery fences. Only a readable local provider state counts.
+ */
+function durableSuspensionProvesProviderDrain(input: {
+  runnerState: Record<string, unknown>;
+  identity: DurableRecoveryIdentity;
+  providerState: ProviderDrainState;
+  semanticResultsSettled: boolean;
+}): boolean {
+  const { runnerState: state, providerState } = input;
+  const acked = state.ackedSourceSeq;
+  const next = state.nextSourceSeq;
+  return (
+    input.semanticResultsSettled &&
+    state.schema === "paperclip.runner.durable.state.v1" &&
+    recoveryIdentityMatches(state, input.identity) &&
+    state.lifecycle === "suspended" &&
+    Array.isArray(state.outbox) &&
+    state.outbox.length === 0 &&
+    (state.pendingTerminalDelivery === undefined || state.pendingTerminalDelivery === null) &&
+    typeof acked === "number" &&
+    typeof next === "number" &&
+    Number.isSafeInteger(acked) &&
+    Number.isSafeInteger(next) &&
+    acked >= 0 &&
+    next === acked + 1 &&
+    providerState !== null &&
+    providerState !== "unreadable" &&
+    providerState.pendingEventCount === 0 &&
+    providerState.providerSettled
+  );
+}
+
 async function awaitProviderDrainBarrier(input: {
   readProviderState: () => ProviderDrainState;
   semanticResultsSettled: () => boolean;
@@ -2480,6 +2517,14 @@ const MAINTENANCE_STATE_FILES = [
 
 function maintenanceDenied(): Error {
   return new Error("native_cleanup_maintenance_unproven");
+}
+
+/** fork: every recorded PID and its process group is gone (ESRCH). */
+function retainedProcessesAbsent(
+  pids: readonly number[],
+  isAbsent: (pid: number) => boolean = maintenanceProcessAbsent,
+): boolean {
+  return pids.length > 0 && pids.every((pid) => isAbsent(pid));
 }
 
 function maintenanceProcessAbsent(pid: number): boolean {
@@ -5274,6 +5319,26 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return operation;
   }
 
+  /**
+   * fork: true only for a local runner whose own exit is confirmed and whose
+   * every recorded PID (runner, sidecar, agent, provider) and process group is
+   * absent. Remote or adopted owners, Windows, and an unknown PID never count.
+   */
+  #retainedProcessesProvablyAbsent(): boolean {
+    try {
+      if (this.options.prepareLaunch || this.options.runnerFilesystemRoot ||
+        this.options.runnerProcessLauncher || this.options.adoptExistingRunner) return false;
+      const evidence = this.#evidence;
+      if (evidence.runnerPid === null || !evidence.runnerExited) return false;
+      if (this.#handle?.isExitConfirmed?.() === false) return false;
+      const pids = [...new Set([evidence.runnerPid, evidence.sidecarPid, evidence.agentPid, evidence.providerPid])]
+        .filter((pid): pid is number => pid !== null);
+      return retainedProcessesAbsent(pids);
+    } catch {
+      return false;
+    }
+  }
+
   detachControllerForRestart(): Promise<void> {
     this.#detachPromise ??= this.#detachControllerOnce();
     return this.#detachPromise;
@@ -5487,6 +5552,30 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           "runner did not prove durable suspension before checkpoint",
         );
       }
+      // fork: the drain receipt can arrive after its 5 s budget when the
+      // controller still commits the run's last events (one checkpoint and
+      // ACK each). The suspended durable state then proves the same thing the
+      // receipt would: nothing left in the outbox, every event ACKed, nothing
+      // retained by the provider. Without this a succeeded run quarantined its
+      // session until a server restart (AMP-553/577/578/589).
+      if (runnerSuspended && !providerDrained) {
+        try {
+          const proven = durableSuspensionProvesProviderDrain({
+            runnerState: await this.#readDurableRunnerState(),
+            identity: this.#core.store.state.identity,
+            providerState: this.#providerDrainState(),
+            semanticResultsSettled: this.#core.semanticToolResultsSettled(),
+          });
+          if (proven) {
+            providerDrained = true;
+            this.#diagnostic(
+              "provider drain proven by the suspended durable runner state after a late drain receipt",
+            );
+          }
+        } catch {
+          // Unreadable state keeps the original fail-closed settlement.
+        }
+      }
       try {
         if (this.#handle) {
           const result = await waitForProcess(
@@ -5597,6 +5686,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         suspensionState,
         semanticTools: this.#core?.semanticToolSettlementDiagnostics(),
         finalProviderState,
+        // fork: lets the runtime lift a quarantine whose owner provably died.
+        retainedProcessesAbsent: this.#retainedProcessesProvablyAbsent(),
       };
       try {
         this.options.onDiagnostic?.(`native_session_settlement_incomplete ${JSON.stringify(settlement)}`);
@@ -8936,6 +9027,8 @@ export const runnerdRecoveryInternals = Object.freeze({
   completedMaintenanceTerminalReplayMatches,
   readControlPlaneState,
   awaitProviderDrainBarrier,
+  durableSuspensionProvesProviderDrain,
+  retainedProcessesAbsent,
   awaitAdoptedRunnerAuthentication,
   awaitRunnerSuspensionBarrier,
   providerDrainStateFromSnapshot,
