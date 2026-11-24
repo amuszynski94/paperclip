@@ -4,6 +4,7 @@ import {
   currentControllerDeployment,
   currentControllerProcessStamp,
   currentProcessSpaceHash,
+  exclusiveInstanceContainerStartedAt,
   observedProcessStartedAt,
   processExists,
   processStartsDefinitelyDiffer,
@@ -91,6 +92,8 @@ export type OwnerProofReason =
   | "generation_superseded"
   | "provider_stopped"
   | "deployment_replaced"
+  /** Fork: recorded in an earlier container of an instance declared single-container. */
+  | "exclusive_container_replaced"
   | "operator_attested"
   /** The owner's server boot stopped cleanly, or a newer boot fenced it after its lease expired. */
   | "controller_stopped"
@@ -143,6 +146,9 @@ export type ProcessProbe = {
    * the platform stops every earlier deployment of the service before it
    * starts this one (a Railway service with an attached volume). */
   deployment?: { worker: WorkspaceWorker; exclusiveVolume: boolean; volumeId?: string | null } | null;
+  /** Fork: this server's start time when the operator declared the instance
+   * single-container (`exclusiveInstanceContainerStartedAt`); otherwise absent. */
+  exclusiveContainerStartedAt?: Date | null;
   /** The lease state of another server boot (controller_instances), when this server can read it. */
   controllerInstance?: (bootId: string, touchedAt: Date | null) => Promise<ControllerInstanceState | null>;
   /** Report without changing any lease row (a read-only reconciliation pass). */
@@ -170,6 +176,7 @@ export function currentDeploymentIdentity(env: NodeJS.ProcessEnv = process.env):
 export function currentProcessProbe(): ProcessProbe {
   return {
     deployment: currentDeploymentIdentity(),
+    exclusiveContainerStartedAt: exclusiveInstanceContainerStartedAt(),
     bootId: currentControllerBootId(),
     host: hostname(),
     processSpace: currentProcessSpaceHash(),
@@ -281,6 +288,12 @@ async function proveLocalProcessGone(stamp: LocalOwnerStamp, probe: ProcessProbe
   }
   if (stamp.processSpace === UNKNOWN_PROCESS_SPACE || probe.processSpace === UNKNOWN_PROCESS_SPACE) {
     return { verdict: "unprovable", reason: "unknown_process_space" };
+  }
+  const otherSpace = Boolean(stamp.host && stamp.host !== probe.host) || stamp.processSpace !== probe.processSpace;
+  // Fork: an earlier container of an exclusive instance is gone with every process in it.
+  if (otherSpace && probe.exclusiveContainerStartedAt && stamp.processStartedAt &&
+      Date.parse(stamp.processStartedAt) < probe.exclusiveContainerStartedAt.getTime() - PROCESS_START_PRECISION_MS) {
+    return { verdict: "gone", reason: "exclusive_container_replaced" };
   }
   if (stamp.host && stamp.host !== probe.host) return { verdict: "unprovable", reason: "different_host" };
   if (stamp.processSpace !== probe.processSpace) return { verdict: "unprovable", reason: "different_process_space" };

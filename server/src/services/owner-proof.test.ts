@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { currentProcessStartedAtMs, processExists, resetCurrentProcessStartedAtForTests } from "./controller-process-identity.js";
+import {
+  currentProcessStartedAtMs, exclusiveInstanceContainerStartedAt, processExists, resetCurrentProcessStartedAtForTests,
+} from "./controller-process-identity.js";
 import * as hotRestart from "./hot-restart.js";
 import {
   currentLocalOwnerStamp,
@@ -74,6 +76,34 @@ describe("proveOwnerGone: local owners", () => {
       .toEqual({ verdict: "unprovable", reason: "unknown_process_space" });
     expect(await proveOwnerGone(stamp(), probe({ processSpace: "unknown" })))
       .toEqual({ verdict: "unprovable", reason: "unknown_process_space" });
+  });
+
+  it("proves an owner from an earlier container of a single-container instance gone (fork)", async () => {
+    const exclusive = { exclusiveContainerStartedAt: at(60_000) };
+    // Another host or PID space, started before this server: its container stopped first.
+    for (const other of [{ host: "host-b" }, { processSpace: "space-b" }, { host: "host-b", processSpace: "space-b", processGroupId: 4242 }]) {
+      expect(await proveOwnerGone(stamp(other), probe(exclusive)))
+        .toEqual({ verdict: "gone", reason: "exclusive_container_replaced" });
+    }
+    // Started within 1 s of (or after) this server: not provably an earlier container.
+    expect(await proveOwnerGone(stamp({ host: "host-b" }), probe({ exclusiveContainerStartedAt: at(500) })))
+      .toEqual({ verdict: "unprovable", reason: "different_host" });
+    expect(await proveOwnerGone(stamp({ processSpace: "space-b", processStartedAt: null }), probe(exclusive)))
+      .toEqual({ verdict: "unprovable", reason: "different_process_space" });
+    // Without the declaration nothing changes; the same space is still judged by its PID.
+    expect(await proveOwnerGone(stamp({ host: "host-b" }), probe())).toEqual({ verdict: "unprovable", reason: "different_host" });
+    expect(await proveOwnerGone(stamp(), probe({ ...exclusive, alive: [4242], starts: { 4242: at(0) } })))
+      .toEqual({ verdict: "alive", reason: "pid_alive" });
+    expect(await proveOwnerGone(stamp({ processSpace: "unknown" }), probe(exclusive)))
+      .toEqual({ verdict: "unprovable", reason: "unknown_process_space" });
+  });
+
+  it("reads the single-container declaration from PAPERCLIP_EXCLUSIVE_INSTANCE_CONTAINER (fork)", () => {
+    expect(exclusiveInstanceContainerStartedAt({})).toBeNull();
+    expect(exclusiveInstanceContainerStartedAt({ PAPERCLIP_EXCLUSIVE_INSTANCE_CONTAINER: "false" })).toBeNull();
+    const startedAt = exclusiveInstanceContainerStartedAt({ PAPERCLIP_EXCLUSIVE_INSTANCE_CONTAINER: "true" });
+    expect(startedAt!.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(startedAt!.getTime()).toBeGreaterThan(Date.now() - process.uptime() * 1000 - 5_000);
   });
 
   it("treats a stamp without a PID or process space as unprovable", async () => {

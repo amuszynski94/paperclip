@@ -206,6 +206,20 @@ export async function controllerProcessExited(controller: ControllerProcess): Pr
   return observed !== null && processStartsDefinitelyDiffer(controller.processStartedAt, new Date(observed));
 }
 
+const serverStartedAtMs = Date.now() - Math.round(process.uptime() * 1000);
+
+/**
+ * Fork: the operator's declaration that this instance's data runs in exactly
+ * one container at a time, and that every earlier container was stopped before
+ * this one started (the hub's deploy-vps does `docker stop` before `docker
+ * run`). A container's processes all die with its PID namespace, so a local
+ * process recorded in another PID space before this server started cannot
+ * still run. Returns this server's start time, or null when not declared.
+ */
+export function exclusiveInstanceContainerStartedAt(env: NodeJS.ProcessEnv = process.env): Date | null {
+  return env.PAPERCLIP_EXCLUSIVE_INSTANCE_CONTAINER?.trim().toLowerCase() === "true" ? new Date(serverStartedAtMs) : null;
+}
+
 /** This process's PID-space hash. An unreadable space is stored as
  * "unknown", which `sameProcessSpace` never accepts. */
 export function currentProcessSpaceHash(): string {

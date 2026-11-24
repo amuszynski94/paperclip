@@ -7,7 +7,7 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { nativeSessionProviderEvidence } from "./native-runtime/native-session-resume.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import os from "node:os";
-import { currentProcessSpaceHash } from "./controller-process-identity.js";
+import { currentProcessSpaceHash, exclusiveInstanceContainerStartedAt } from "./controller-process-identity.js";
 import { proveOwnerGone } from "./owner-proof.js";
 
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
@@ -35,7 +35,11 @@ export async function recordedLocalExecutionStopped(db: Db, run: Pick<typeof hea
     isNull(heartbeatRunEvents.sourceEventId),
   )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
   const recorded = identity?.payload;
-  if (identity?.eventType !== PROCESS_IDENTITY_RECORDED || recorded?.targetKind !== "local" || recorded.hostname !== os.hostname() ||
+  // Fork: another host passes on to the prover only on an instance declared
+  // single-container, where it proves an earlier container that has stopped.
+  const sameHost = recorded?.hostname === os.hostname();
+  if (identity?.eventType !== PROCESS_IDENTITY_RECORDED || recorded?.targetKind !== "local" ||
+      (!sameHost && (typeof recorded.hostname !== "string" || !recorded.hostname || !exclusiveInstanceContainerStartedAt())) ||
       recorded.processPid !== run.processPid || recorded.processGroupId !== run.processGroupId ||
       !run.processStartedAt || recorded.processStartedAt !== run.processStartedAt.toISOString()) return false;
   if (!run.processPid) return false;
@@ -43,7 +47,8 @@ export async function recordedLocalExecutionStopped(db: Db, run: Pick<typeof hea
   // a later process, and its group is empty or led by a later process. The
   // recorded PID space is used when the row has one; older rows were bound to
   // this host by the launch event above.
-  const proof = await proveOwnerGone({ kind: "local", scope: "native_local_process", generation: null, host: null,
+  const proof = await proveOwnerGone({ kind: "local", scope: "native_local_process", generation: null,
+    host: sameHost ? null : recorded.hostname as string,
     processSpace: run.processHostHash ?? currentProcessSpaceHash(), bootId: null, pid: run.processPid,
     processStartedAt: run.processStartedAt.toISOString(), processGroupId: run.processGroupId });
   return proof.verdict === "gone";

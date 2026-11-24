@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { currentProcessSpaceHash, currentProcessStartedAtMs } from "./controller-process-identity.js";
@@ -27,12 +27,12 @@ const support = await getEmbeddedPostgresTestSupport();
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
   /** A failed run with its process identity bound by the launch event. */
-  async function execution(input: { pid: number; startedAt: Date; processHostHash: string | null }) {
+  async function execution(input: { pid: number; startedAt: Date; processHostHash: string | null; host?: string }) {
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native",
       processPid: input.pid, processGroupId: input.pid, processStartedAt: input.startedAt,
       processHostHash: input.processHostHash }).returning();
     await appendHeartbeatRunEvent(db, { companyId, runId: run!.id, agentId, eventType: PROCESS_IDENTITY_RECORDED,
-      payload: { targetKind: "local", hostname: hostname(), processPid: input.pid, processGroupId: input.pid,
+      payload: { targetKind: "local", hostname: input.host ?? hostname(), processPid: input.pid, processGroupId: input.pid,
         processStartedAt: input.startedAt.toISOString() } });
     return run!;
   }
@@ -48,6 +48,21 @@ const support = await getEmbeddedPostgresTestSupport();
   it("is never stopped by a dead PID recorded in another PID space", async () => {
     expect(await recordedLocalExecutionStopped(db, await execution({ pid: deadPid, startedAt: minuteAgo(),
       processHostHash: "another-pid-space" }))).toBe(false);
+  });
+
+  // Fork: a redeploy recreates the container, so its hostname and PID space change (AMP-553).
+  it("is stopped when recorded in an earlier container of a single-container instance", async () => {
+    const beforeThisServer = new Date((await ownStart()).getTime() - 60_000);
+    const earlier = { pid: deadPid, startedAt: beforeThisServer, host: "5d0841dec740" };
+    expect(await recordedLocalExecutionStopped(db, await execution({ ...earlier, processHostHash: null }))).toBe(false);
+    vi.stubEnv("PAPERCLIP_EXCLUSIVE_INSTANCE_CONTAINER", "true");
+    try {
+      expect(await recordedLocalExecutionStopped(db, await execution({ ...earlier, processHostHash: null }))).toBe(true);
+      expect(await recordedLocalExecutionStopped(db, await execution({ ...earlier, processHostHash: "another-pid-space" }))).toBe(true);
+      // Recorded after this server started: not an earlier container.
+      expect(await recordedLocalExecutionStopped(db, await execution({ ...earlier, startedAt: new Date(),
+        processHostHash: null }))).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("keeps the host-bound proof for a row saved before its PID space", async () => {
