@@ -221,6 +221,8 @@ import {
   isNull,
   isNotNull,
   like,
+  lt,
+  ne,
   notInArray,
   or,
   sql,
@@ -2101,6 +2103,20 @@ function nativeSessionScopeKey(execution: NativeExecutionInput): string {
   });
 }
 
+/** The session scope without its normalized session: the same agent, workspace
+ * and provider identity, whatever conversation the run was assigned. */
+function nativeSessionSharedScopeKey(execution: NativeExecutionInput): string {
+  return canonicalJson({
+    companyId: execution.binding.companyId,
+    agentId: execution.binding.agentId,
+    workspace: nativeSessionWorkspaceScope(execution),
+    provider: {
+      driverKind: execution.session.driverKind,
+      identity: nativeProviderSessionScope(execution),
+    },
+  });
+}
+
 // A plan acceptance or explicit reset can rotate the provider/session identity
 // while retaining the same task sandbox and its fixed ingress port.
 function nativeSessionOwnerScope(
@@ -2551,6 +2567,14 @@ function cleanupStateSnapshot(root: string, providerFile = "codex-provider-state
       .update(JSON.stringify(fileSha256))
       .digest("hex"),
   };
+}
+
+/** True only when the scope never received runnerd state: not one canonical
+ * file (or a link in its place) exists. Anything present takes the full proof. */
+function runnerdCleanupStateAbsent(root: string, providerFile: string): boolean {
+  return [...CLEANUP_CANONICAL_FILES.slice(0, 2), `runner/${providerFile}`].every(
+    (file) => !lstatSync(resolve(root, file), { throwIfNoEntry: false }),
+  );
 }
 
 function cleanupProcessAbsent(pid: unknown): pid is number {
@@ -3154,30 +3178,59 @@ export async function verifyStoppedNativeSessionForContinuation(
         execution.binding.agentId !== run.agentId || execution.binding.issueId !== run.nativeIssueId ||
         nativeSessionKey(execution) !== run.nativeSessionId) return null;
     const scope = nativeSessionScopeKey(execution);
-    const idle = () => !activeNativeSessions.has(run.id) && !executingRunnerdSessionScopes.has(scope) &&
-      !initializingSessionToolAuthorities.has(scope) && !warmNativeSessions.has(scope);
+    const scopes = new Set([scope]);
+    const idle = () => !activeNativeSessions.has(run.id) && [...scopes].every(key => !executingRunnerdSessionScopes.has(key) &&
+      !initializingSessionToolAuthorities.has(key) && !warmNativeSessions.has(key));
     if (!idle()) return null;
     const leases = await db.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
     if (leases.some(lease => lease.provider !== "local" || !lease.releasedAt ||
         lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return null;
-    const root = scopedRunnerdStateRoot(execution);
-    const providerFile = runnerProviderStateFilename(execution);
+    const launched = async () => Boolean((await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+      inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
+        "session.started", "session.resumed", "session.reconciled"]))).limit(1))[0]);
+    let root = scopedRunnerdStateRoot(execution);
+    let providerFile = runnerProviderStateFilename(execution);
+    // A run refused before launch may have been assigned a fresh normalized
+    // session (the previous one could not be resumed). Its own runnerd scope
+    // then holds nothing, and the in-memory quarantine it hit belonged to the
+    // task's previous owner. Certify that owner from the owner's own session
+    // scope and identity; every stop guard below still applies to it.
+    let freshSessionOwner: typeof heartbeatRuns.$inferSelect | null = null;
+    if (runnerdCleanupStateAbsent(root, providerFile)) {
+      if (run.errorCode !== "native_session_cleanup_quarantined" ||
+          run.processPid || run.processGroupId || run.processStartedAt || await launched()) return null;
+      const [previous] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.nativeIssueId, run.nativeIssueId),
+        eq(heartbeatRuns.runtimeMode, "native"), lt(heartbeatRuns.createdAt, run.createdAt), ne(heartbeatRuns.id, run.id),
+      )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+      // Only the task's immediately previous run can be the quarantined owner.
+      if (!previous || previous.agentId !== run.agentId || !previous.nativeSessionId || !previous.runnerInstanceId ||
+          previous.nativeSessionId === run.nativeSessionId) return null;
+      const previousExecution = parseNativeExecutionInput(record(previous.runnerProfileJson).nativeExecutionInput);
+      if (nativeSessionKey(previousExecution) !== previous.nativeSessionId ||
+          nativeSessionSharedScopeKey(previousExecution) !== nativeSessionSharedScopeKey(execution)) return null;
+      root = scopedRunnerdStateRoot(previousExecution);
+      providerFile = runnerProviderStateFilename(previousExecution);
+      scopes.add(nativeSessionScopeKey(previousExecution));
+      if (!idle()) return null;
+      freshSessionOwner = previous;
+    }
     const snapshot = cleanupStateSnapshot(root, providerFile);
     const identity = record(snapshot.control.identity);
     let owner = run;
     let ownerExecution = execution;
-    if (identity.runId !== run.id) {
+    if (identity.runId !== run.id || freshSessionOwner) {
       if (run.errorCode !== "native_session_cleanup_quarantined" || typeof identity.runId !== "string") return null;
-      const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
-        eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
-        inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
-          "session.started", "session.resumed", "session.reconciled"]))).limit(1);
-      if (started) return null;
+      if (freshSessionOwner && identity.runId !== freshSessionOwner.id) return null;
+      if (await launched()) return null;
+      const ownerSessionId = freshSessionOwner?.nativeSessionId ?? run.nativeSessionId;
+      const ownerRunnerInstanceId = freshSessionOwner?.runnerInstanceId ?? run.runnerInstanceId;
       const [retainedRow] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, identity.runId),
         eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.nativeIssueId, run.nativeIssueId),
-        eq(heartbeatRuns.nativeSessionId, run.nativeSessionId), eq(heartbeatRuns.runnerInstanceId, run.runnerInstanceId),
+        eq(heartbeatRuns.nativeSessionId, ownerSessionId), eq(heartbeatRuns.runnerInstanceId, ownerRunnerInstanceId),
       )).for("update", { noWait: true }).limit(1);
       const retained = retainedRow ? await withReleasedNativeRunProcess(db, retainedRow) : null;
       if (!retained || retained.runtimeMode !== "native" ||
@@ -3201,7 +3254,11 @@ export async function verifyStoppedNativeSessionForContinuation(
       ownerExecution = parseNativeExecutionInput(record(retained.runnerProfileJson).nativeExecutionInput);
       if (ownerExecution.binding.runId !== retained.id || ownerExecution.binding.companyId !== run.companyId ||
           ownerExecution.binding.agentId !== run.agentId || ownerExecution.binding.issueId !== run.nativeIssueId ||
-          nativeSessionScopeKey(ownerExecution) !== scope || ownerExecution.workspace.cwd !== execution.workspace.cwd) return null;
+          (freshSessionOwner
+            ? nativeSessionKey(ownerExecution) !== retained.nativeSessionId ||
+              nativeSessionSharedScopeKey(ownerExecution) !== nativeSessionSharedScopeKey(execution)
+            : nativeSessionScopeKey(ownerExecution) !== scope) ||
+          ownerExecution.workspace.cwd !== execution.workspace.cwd) return null;
       const ownerLeases = await db.select().from(environmentLeases).where(and(
         eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, retained.id)));
       if (ownerLeases.some(lease => lease.provider !== "local" || !lease.releasedAt ||
@@ -3224,7 +3281,7 @@ export async function verifyStoppedNativeSessionForContinuation(
     // session identity. It cannot be certified from an earlier owner's receipt.
     if (!RUNNERD_CONTROL_PLANE_STATE_SCHEMAS.has(String(snapshot.control.schema)) ||
         snapshot.runner.schema !== RUNNERD_STATE_SCHEMA ||
-        snapshot.provider.schema !== (execution.provider.kind === "codex" ? "paperclip.runner.codex-provider-state.v1" : ACPX_PROVIDER_STATE_SCHEMA) ||
+        snapshot.provider.schema !== (ownerExecution.provider.kind === "codex" ? "paperclip.runner.codex-provider-state.v1" : ACPX_PROVIDER_STATE_SCHEMA) ||
         !["turn_active", "prepared", "suspended", "session_open"].includes(String(snapshot.provider.lifecycle)) ||
         snapshot.provider.startupAttempt != null) return null;
     const pending = JSON.stringify([snapshot.runner.outbox, snapshot.provider.pendingEvents, snapshot.provider.queuedEvents]);
@@ -3243,7 +3300,7 @@ export async function verifyStoppedNativeSessionForContinuation(
     for (const [index, event] of providerEvents.entries()) {
       const provider = record(event.payload);
       if (!validatePrpEvent(event).ok || event.sourceKind !== "runner" || event.sourceInstanceId !== owner.runnerInstanceId ||
-          event.runId !== owner.id || event.normalizedSessionId !== run.nativeSessionId ||
+          event.runId !== owner.id || event.normalizedSessionId !== owner.nativeSessionId ||
           typeof provider.providerSessionId !== "string" || !provider.providerSessionId ||
           !cleanupProcessAbsent(provider.processId) || provider.processId === stopped.processPid) return null;
       if (event.eventType === "session.reconciled" &&
@@ -3252,7 +3309,7 @@ export async function verifyStoppedNativeSessionForContinuation(
       const durable = record(record(receipt?.payload).prpEvent);
       const durableProvider = record(durable.payload);
       if (!receipt || !validatePrpEvent(durable).ok || durable.sourceInstanceId !== event.sourceInstanceId ||
-          durable.runId !== owner.id || durable.normalizedSessionId !== run.nativeSessionId ||
+          durable.runId !== owner.id || durable.normalizedSessionId !== owner.nativeSessionId ||
           // Normalized session-open receipts omit turn/item IDs. Those belong
           // to the durable runner identity checked above, not the open event.
           durable.sourceSeq !== receipt.sourceSeq || durable.eventType !== event.eventType ||
@@ -3293,10 +3350,11 @@ export async function verifyStoppedNativeSessionForContinuation(
         ownerRunId: owner.id,
         executionWorkspaceId: execution.binding.executionWorkspaceId, workspaceCwd: execution.workspace.cwd,
         nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
+        ...(freshSessionOwner ? { ownerNativeSessionId: owner.nativeSessionId, ownerRunnerInstanceId: owner.runnerInstanceId } : {}),
         processPid: stopped.processPid, providerPids: [...providerPids], stateFingerprint: snapshot.fingerprint },
       retire: () => {
-        try { return unchanged() && [owner.id, run.id].every(runId => completeTerminatedLocalNativeSessionCleanup({
-          companyId: run.companyId, runId, runnerInstanceId: run.runnerInstanceId!,
+        try { return unchanged() && [owner, run].every(entry => completeTerminatedLocalNativeSessionCleanup({
+          companyId: run.companyId, runId: entry.id, runnerInstanceId: entry.runnerInstanceId!,
         })); } catch { return false; }
       },
     };

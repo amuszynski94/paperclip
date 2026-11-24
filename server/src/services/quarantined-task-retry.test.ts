@@ -273,6 +273,54 @@ describe("task Retry after inherited native cleanup quarantine", () => {
     }
   });
 
+  it.each(["stopped", "source_launch_requested", "owner_running", "not_previous_run", "source_state_present", "foreign_runner", "foreign_workspace"])(
+    "certifies a source refused on a fresh session from the previous owner's own identity (%s)", async mode => {
+    // AMP-589: the owner's close was quarantined, so the next run could not
+    // resume its session. It got a fresh session and runner instance, and the
+    // quarantine refused it before launch. Its own runnerd scope is empty.
+    const base = await mkdtemp(join(tmpdir(), "quarantined-fresh-session-"));
+    const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = base;
+    try {
+      const f = await seed(base);
+      const freshSessionId = randomUUID();
+      const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceId));
+      const input = parseNativeExecutionInput(before.runnerProfileJson!.nativeExecutionInput);
+      await db.update(heartbeatRuns).set({ processPid: null, processGroupId: null, processStartedAt: null,
+        nativeSessionId: freshSessionId, runnerInstanceId: randomUUID(),
+        runnerProfileJson: { ...before.runnerProfileJson, nativeExecutionInput: { ...input,
+          session: { ...input.session, normalizedSessionId: freshSessionId },
+          ...(mode === "foreign_workspace" ? { binding: { ...input.binding, executionWorkspaceId: randomUUID() } } : {}),
+        } } }).where(eq(heartbeatRuns.id, f.sourceId));
+      if (mode === "source_launch_requested") await appendHeartbeatRunEvent(db, {
+        companyId: f.companyId, runId: f.sourceId, agentId: f.agentId, eventType: PROCESS_START_REQUESTED });
+      if (mode === "owner_running") await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.ownerId));
+      if (mode === "foreign_runner") await db.update(heartbeatRuns).set({ runnerInstanceId: randomUUID() }).where(eq(heartbeatRuns.id, f.ownerId));
+      if (mode === "not_previous_run") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, nativeIssueId: f.issueId, runtimeMode: "native", status: "failed",
+        createdAt: new Date(Date.now() - 80_000), finishedAt: new Date(Date.now() - 79_000) });
+      if (mode === "source_state_present") {
+        const sourceRoot = join(base, nativeSha256({ schema: "paperclip.native-session-scope.v2", companyId: f.companyId, agentId: f.agentId,
+          workspace: { kind: "managed", executionWorkspaceId: f.workspaceId },
+          provider: { driverKind: "codex_app_server", identity: { kind: "codex" } }, normalizedSessionId: freshSessionId }));
+        await mkdir(join(sourceRoot, "control-plane"), { recursive: true });
+        await writeFile(join(sourceRoot, "control-plane/control-plane-state.json"), "{}");
+      }
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceId));
+      const proof = await verifyStoppedNativeSessionForContinuation(db, source);
+      if (mode === "stopped") {
+        expect(proof).not.toBeNull();
+        expect(proof!.evidence).toMatchObject({ runId: f.sourceId, ownerRunId: f.ownerId, nativeSessionId: freshSessionId,
+          runnerInstanceId: source.runnerInstanceId, ownerRunnerInstanceId: f.runnerInstanceId });
+        expect(proof!.retire()).toBe(true);
+        for (const [path, value] of Object.entries(f.files)) expect(await readFile(join(f.root, path), "utf8")).toBe(JSON.stringify(value));
+      } else expect(proof).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("holds a Retry while the task's own provider session close is still retained, then starts it", async () => {
     const base = await mkdtemp(join(tmpdir(), "retained-close-retry-"));
     const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
